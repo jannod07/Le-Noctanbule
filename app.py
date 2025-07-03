@@ -11,7 +11,6 @@ from email.mime.base import MIMEBase
 from email import encoders
 from email.mime.text import MIMEText
 import plotly.express as px
-import numpy as np
 
 # --- Constantes ---
 DB_FILE = "ventes_restaurant.db"
@@ -251,54 +250,12 @@ def main():
 
     if choix == "Tableau de bord combiné":
         ventes = get_data("ventes")
-        points = get_data("points_cabines")
-
-        if ventes.empty:
-            st.warning("Aucune donnée de ventes trouvée.")
-        if points.empty:
-            st.warning("Aucune donnée de points cabines trouvée.")
-
-        # Conversion dates et calcul montant
-        ventes["date"] = pd.to_datetime(ventes["date"])
-        points["date"] = pd.to_datetime(points["date"])
         ventes["montant"] = ventes["quantite"] * ventes["prix_unitaire"]
-
-        # FILTRES DYNAMIQUES EN SIDEBAR (spécifiques au dashboard)
-        st.sidebar.subheader("Filtres Tableau de bord combiné")
-
-        # Filtres cabines
-        cabines_dispo = points["numero_cabine"].dropna().unique()
-        filtres_cabines = st.sidebar.multiselect("Filtrer par cabine", options=cabines_dispo, default=list(cabines_dispo))
-
-        # Filtres opérateurs
-        operateurs_dispo = points["operateur"].dropna().unique()
-        filtres_operateurs = st.sidebar.multiselect("Filtrer par opérateur Mobile Money", options=operateurs_dispo, default=list(operateurs_dispo))
-
-        # Filtre dates
-        date_min = min(ventes["date"].min(), points["date"].min())
-        date_max = max(ventes["date"].max(), points["date"].max())
-        date_debut = st.sidebar.date_input("Date début", value=date_min)
-        date_fin = st.sidebar.date_input("Date fin", value=date_max)
-
-        # Application filtres
-        ventes_f = ventes[(ventes["date"] >= pd.to_datetime(date_debut)) & (ventes["date"] <= pd.to_datetime(date_fin))]
-        points_f = points[
-            (points["date"] >= pd.to_datetime(date_debut)) &
-            (points["date"] <= pd.to_datetime(date_fin)) &
-            (points["numero_cabine"].isin(filtres_cabines)) &
-            (points["operateur"].isin(filtres_operateurs))
-        ]
-
-        # Calculs pour les métriques
-        total_ventes = ventes_f["montant"].sum()
-        total_mm_commissions = points_f["commissions"].sum()
         sorties = get_data("sorties")
-        sorties["montant"] = sorties["montant"].astype(float)
-        sorties_f = sorties[
-            (pd.to_datetime(sorties["date"]) >= pd.to_datetime(date_debut)) &
-            (pd.to_datetime(sorties["date"]) <= pd.to_datetime(date_fin))
-        ]
-        total_sorties = sorties_f["montant"].sum()
+        points = get_data("points_cabines")
+        total_ventes = ventes["montant"].sum()
+        total_sorties = sorties["montant"].sum()
+        total_mm_commissions = points["commissions"].sum()
         benefice_global = total_ventes + total_mm_commissions - total_sorties
 
         st.metric("Total ventes restaurant", f"{total_ventes:,.0f} FCFA")
@@ -306,171 +263,162 @@ def main():
         st.metric("Total sorties", f"{total_sorties:,.0f} FCFA")
         st.metric("Bénéfice global", f"{benefice_global:,.0f} FCFA")
 
-        # Détail Dataframes (avec pagination intégrée)
-        st.subheader("Détail ventes restaurant filtrées")
-        st.dataframe(ventes_f)
+        st.subheader("Détail ventes restaurant")
+        st.dataframe(ventes)
 
-        st.subheader("Détail points cabines Mobile Money filtrés")
-        st.dataframe(points_f)
+        st.subheader("Détail points cabines Mobile Money")
+        st.dataframe(points)
 
-        # Graphique 1 : Évolution des ventes dans le temps
-        ventes_date = ventes_f.groupby("date").agg({"montant": "sum"}).reset_index()
-        fig_ventes = px.line(
-            ventes_date,
-            x="date",
-            y="montant",
-            title="Évolution des ventes dans le temps",
-            labels={"montant": "Montant des ventes (FCFA)", "date": "Date"}
-        )
-        st.plotly_chart(fig_ventes, use_container_width=True)
+        # Graphiques ventes par catégorie
+        if not ventes.empty:
+            ventes_categ = ventes.groupby("categorie").agg({"montant":"sum"}).reset_index()
+            fig = px.pie(ventes_categ, names="categorie", values="montant", title="Répartition des ventes par catégorie")
+            st.plotly_chart(fig, use_container_width=True)
 
-        # Graphique 2 : Évolution des commissions par cabine
-        points_commissions = points_f.groupby(["date", "numero_cabine"]).agg({"commissions": "sum"}).reset_index()
-        fig_commissions = px.line(
-            points_commissions,
-            x="date",
-            y="commissions",
-            color="numero_cabine",
-            title="Évolution des commissions par cabine",
-            labels={"commissions": "Commissions (FCFA)", "date": "Date", "numero_cabine": "Cabine"}
-        )
-        st.plotly_chart(fig_commissions, use_container_width=True)
-
-        # Graphique 3 : Heatmap ventes par jour et heure (simulation heure)
-        ventes_f["heure"] = np.random.randint(0, 24, size=len(ventes_f))
-        ventes_f["jour_semaine"] = ventes_f["date"].dt.day_name()
-        jours_ordonnes = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        ventes_f["jour_semaine"] = pd.Categorical(ventes_f["jour_semaine"], categories=jours_ordonnes, ordered=True)
-        heatmap_data = ventes_f.groupby(["jour_semaine", "heure"]).agg({"quantite": "sum"}).reset_index()
-
-        fig_heatmap = px.density_heatmap(
-            heatmap_data,
-            x="heure",
-            y="jour_semaine",
-            z="quantite",
-            title="Heatmap des ventes par jour et heure",
-            labels={"heure": "Heure", "jour_semaine": "Jour de la semaine", "quantite": "Quantité vendue"}
-        )
-        st.plotly_chart(fig_heatmap, use_container_width=True)
-
-        # Graphique 4 : Barres empilées par catégorie et cabine
-        # Fusion partielle des ventes et points_cabines sur date et cabine
-        ventes_points = pd.merge(
-            ventes_f,
-            points_f[["date", "numero_cabine"]],
-            how="left",
-            on="date"
-        )
-        ventes_points["montant"] = ventes_points["quantite"] * ventes_points["prix_unitaire"]
-
-        bar_data = ventes_points.groupby(["categorie", "numero_cabine"]).agg({"montant": "sum"}).reset_index()
-
-        fig_bar = px.bar(
-            bar_data,
-            x="categorie",
-            y="montant",
-            color="numero_cabine",
-            title="Ventes par catégorie et cabine (barres empilées)",
-            labels={"montant": "Montant (FCFA)", "categorie": "Catégorie", "numero_cabine": "Cabine"},
-            barmode="stack"
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        # Graphique évolution des ventes dans le temps
+        if not ventes.empty:
+            ventes_date = ventes.groupby("date").agg({"montant":"sum"}).reset_index()
+            fig2 = px.bar(ventes_date, x="date", y="montant", title="Évolution des ventes dans le temps")
+            st.plotly_chart(fig2, use_container_width=True)
 
     elif choix == "Ajouter vente":
         st.subheader("Nouvelle vente")
         date = st.date_input("Date", value=datetime.now().date())
         produit = st.text_input("Produit")
         categorie = st.selectbox("Catégorie", ["Bière", "Plat", "Boisson", "Autre"])
-        quantite = st.number_input("Quantité", min_value=1, step=1)
-        prix_unitaire = st.number_input("Prix unitaire (FCFA)", min_value=0.0, step=100.0)
-
-        if st.button("Ajouter vente"):
-            if confirmer_ajout("Confirmer l'ajout de cette vente"):
-                ajouter_vente(date.strftime("%Y-%m-%d"), produit, categorie, quantite, prix_unitaire)
-                st.success("Vente ajoutée avec succès !")
+        quantite = st.number_input("Quantité", min_value=1)
+        prix = st.number_input("Prix unitaire", min_value=0.0)
+        if confirmer_ajout("Confirmer l'ajout") and st.button("Valider"):
+            ajouter_vente(str(date), produit, categorie, quantite, prix)
+            st.success("Vente enregistrée.")
 
     elif choix == "Ajouter sortie":
         st.subheader("Nouvelle sortie")
         date = st.date_input("Date", value=datetime.now().date())
         description = st.text_input("Description")
-        montant = st.number_input("Montant (FCFA)", min_value=0.0, step=100.0)
-
-        if st.button("Ajouter sortie"):
-            if confirmer_ajout("Confirmer l'ajout de cette sortie"):
-                ajouter_sortie(date.strftime("%Y-%m-%d"), description, montant)
-                st.success("Sortie ajoutée avec succès !")
+        montant = st.number_input("Montant", min_value=0.0)
+        if confirmer_ajout("Confirmer l'ajout") and st.button("Valider"):
+            ajouter_sortie(str(date), description, montant)
+            st.success("Sortie enregistrée.")
 
     elif choix == "Gestion cabines":
-        st.subheader("Gestion des cabines Mobile Money")
-        cabines = get_data("cabines")
-        st.dataframe(cabines)
-        with st.form("Ajouter/Modifier cabine"):
-            numero = st.text_input("Numéro cabine")
-            statut = st.selectbox("Statut", ["Ouverte", "Fermée"])
-            date_ouverture = st.date_input("Date ouverture", value=datetime.now().date())
-            date_fermeture = st.date_input("Date fermeture", value=datetime.now().date())
-            operateur = st.text_input("Opérateur Mobile Money")
-            solde_actuel = st.number_input("Solde actuel", min_value=0.0)
-            total_commissions = st.number_input("Total commissions", min_value=0.0)
-            submit = st.form_submit_button("Ajouter/Modifier cabine")
-            if submit:
-                if confirmer_ajout("Confirmer l'ajout/modification cabine"):
-                    ajouter_cabine(numero, statut, date_ouverture.strftime("%Y-%m-%d"), date_fermeture.strftime("%Y-%m-%d"),
-                                  operateur, solde_actuel, total_commissions)
-                    st.success("Cabine ajoutée/modifiée")
+        st.subheader("Ajouter une cabine")
+        numero = st.text_input("Numéro cabine")
+        statut = st.selectbox("Statut", ["Active", "Inoccupée", "En maintenance"])
+        date_ouverture = st.date_input("Date d'ouverture", value=datetime.now().date())
+        date_fermeture = st.text_input("Date de fermeture (facultatif)", value="")
+        operateur = st.selectbox("Opérateur", ["MTN", "Moov", "Wave", "Autre"])
+        solde_actuel = st.number_input("Solde actuel (FCFA)", min_value=0.0)
+        total_commissions = st.number_input("Total commissions (FCFA)", min_value=0.0)
+        if confirmer_ajout("Confirmer l'ajout") and st.button("Ajouter"):
+            ajouter_cabine(numero, statut, str(date_ouverture), date_fermeture if date_fermeture else None,
+                           operateur, solde_actuel, total_commissions)
+            st.success("Cabine ajoutée.")
+        st.subheader("Liste des cabines")
+        st.dataframe(get_data("cabines"))
 
     elif choix == "Points journaliers Mobile Money":
-        st.subheader("Points journaliers Mobile Money")
-        points = get_data("points_cabines")
-        st.dataframe(points)
-
-        with st.form("Ajouter point journalier"):
-            date = st.date_input("Date", value=datetime.now().date())
-            numero_cabine = st.text_input("Numéro cabine")
-            operateur = st.text_input("Opérateur Mobile Money")
-            espece = st.number_input("Espèces (FCFA)", min_value=0.0)
-            float_val = st.number_input("Float (FCFA)", min_value=0.0)
-            credit = st.number_input("Crédit (FCFA)", min_value=0.0)
-            commissions = st.number_input("Commissions (FCFA)", min_value=0.0)
-            submit = st.form_submit_button("Ajouter point")
-            if submit:
-                if confirmer_ajout("Confirmer l'ajout du point"):
-                    ajouter_point_journalier(date.strftime("%Y-%m-%d"), numero_cabine, operateur, espece, float_val, credit, commissions)
-                    st.success("Point ajouté")
+        st.subheader("Ajouter point journalier Mobile Money")
+        date = st.date_input("Date", value=datetime.now().date())
+        numero_cabine = st.text_input("Numéro de cabine")
+        operateur = st.selectbox("Opérateur", ["MTN", "Moov", "Celtiis"])
+        espece = st.number_input("Montant en espèces initial", min_value=0.0)
+        float_val = st.number_input("Montant float sur SIM", min_value=0.0)
+        credit = st.number_input("Montant crédit sur SIM", min_value=0.0)
+        commissions = st.number_input("Commission prévue", min_value=0.0)
+        if confirmer_ajout("Confirmer l'ajout") and st.button("Ajouter"):
+            ajouter_point_journalier(str(date), numero_cabine, operateur, espece, float_val, credit, commissions)
+            st.success("Point journalier enregistré.")
+        st.subheader("Historique des points journaliers")
+        st.dataframe(get_data("points_cabines"))
 
     elif choix == "Rapport combiné PDF":
-        st.subheader("Générer un rapport combiné PDF")
-        ventes = get_data("ventes")
-        points = get_data("points_cabines")
+        ventes, points = get_data("ventes"), get_data("points_cabines")
 
-        nom_fichier = f"rapport_combine_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        # Dates par défaut
+        if not ventes.empty:
+            min_date = pd.to_datetime(ventes["date"]).min()
+            max_date = pd.to_datetime(ventes["date"]).max()
+        else:
+            min_date = max_date = datetime.now()
 
-        if st.button("Générer PDF"):
-            path = generer_pdf_combine(ventes, points, nom_fichier)
-            st.success(f"PDF généré : {path}")
+        date_debut = st.date_input("Date début", value=min_date)
+        date_fin = st.date_input("Date fin", value=max_date)
 
-            if st.button("Envoyer PDF par email"):
-                try:
-                    envoyer_email_avec_fichier(path)
-                    st.success("Email envoyé avec succès !")
-                except Exception as e:
-                    st.error(f"Erreur lors de l'envoi de l'email : {e}")
+        # Gestion sécurité colonne numero_cabine
+        if points.empty or "numero_cabine" not in points.columns:
+            cabines_dispo = []
+        else:
+            cabines_dispo = points["numero_cabine"].dropna().unique().tolist()
+
+        if not cabines_dispo:
+            cabines_dispo = ["Aucune cabine"]
+
+        cabine_choisie = st.multiselect("Filtrer par cabine", cabines_dispo,
+                                       default=cabines_dispo if cabines_dispo != ["Aucune cabine"] else [])
+
+        # Filtrage ventes
+        ventes_f = ventes[
+            (pd.to_datetime(ventes["date"]) >= pd.to_datetime(date_debut)) &
+            (pd.to_datetime(ventes["date"]) <= pd.to_datetime(date_fin))
+        ]
+
+        # Filtrage points
+        if "Aucune cabine" in cabine_choisie:
+            points_f = points[
+                (pd.to_datetime(points["date"]) >= pd.to_datetime(date_debut)) &
+                (pd.to_datetime(points["date"]) <= pd.to_datetime(date_fin))
+            ]
+        else:
+            points_f = points[
+                (pd.to_datetime(points["date"]) >= pd.to_datetime(date_debut)) &
+                (pd.to_datetime(points["date"]) <= pd.to_datetime(date_fin)) &
+                (points["numero_cabine"].isin(cabine_choisie))
+            ]
+
+        if st.button("Générer PDF et envoyer par email"):
+            nom_fichier = f"rapport_combine_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            path = generer_pdf_combine(ventes_f, points_f, nom_fichier)
+            envoyer_email_avec_fichier(path)
+            st.success(f"Rapport généré et envoyé à {EMAIL_DESTINATAIRE}")
 
     elif choix == "Historique détaillé":
-        st.subheader("Historique détaillé des données")
-        table = st.selectbox("Choisir la table à afficher", ["ventes", "sorties", "cabines", "points_cabines"])
-        df = get_data(table)
-        st.dataframe(df)
+        st.subheader("Ventes")
+        st.dataframe(get_data("ventes"))
+        st.subheader("Sorties")
+        st.dataframe(get_data("sorties"))
+        st.subheader("Cabines")
+        st.dataframe(get_data("cabines"))
+        st.subheader("Points journaliers Mobile Money")
+        st.dataframe(get_data("points_cabines"))
 
     elif choix == "⚠️ Réinitialiser BDD":
-        if st.button("Réinitialiser la base de données (perte de données irréversible)"):
-            if confirmer_ajout("Confirmer la réinitialisation de la base"):
-                os.remove(DB_FILE)
-                init_db()
-                st.success("Base de données réinitialisée !")
+        if st.button("Réinitialiser la base de données (TOUTES les données seront perdues)"):
+            os.remove(DB_FILE) if os.path.exists(DB_FILE) else None
+            init_db()
+            st.success("Base de données réinitialisée.")
 
-    else:
-        st.info("Utilisez le menu pour naviguer entre les fonctionnalités.")
+    # FOOTER
+    st.markdown(
+        f"""
+        <style>
+        footer {{
+            position: fixed;
+            left: 0;
+            bottom: 0;
+            width: 100%;
+            background-color: #f0f2f6;
+            text-align: center;
+            padding: 10px 0;
+            font-size: 12px;
+            color: #888888;
+            z-index: 9999;
+        }}
+        </style>
+        <footer>© 2025 {BAR_NOM} | Contact : {BAR_CONTACT} | Développé par Jannos AHANNINKPO</footer>
+        """,
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
     main()
