@@ -1,424 +1,336 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
-import sqlite3
 import pandas as pd
+import sqlite3
 from datetime import datetime
-from fpdf import FPDF
-import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
-from email import encoders
 from email.mime.text import MIMEText
-import plotly.express as px
+from email import encoders
+from fpdf import FPDF
+import os
+import time
+from threading import Lock
+import zipfile  # ### MODIFICATION 1 ### : Import pour créer des fichiers ZIP
+from pathlib import Path
 
-# --- Constantes ---
-DB_FILE = "ventes_restaurant.db"
-RAPPORTS_DIR = "rapports"
+# --------------------------
+# Configuration Email
+# --------------------------
 EMAIL_SOURCE = "ahanninkpojannos@gmail.com"
-EMAIL_DESTINATAIRE = "ahanninkpojannos@gmail.com"
-EMAIL_MDP = "xctk xfok vanj jkjj"  # mot de passe application Gmail
+EMAIL_MDP = "xctk xfok vanj jkjj" # Assurez-vous d'utiliser un mot de passe d'application valide
 
-BAR_NOM = "Le Noctambul"
-BAR_CONTACT = "+229 0190661015"
+# --------------------------
+# Database
+# --------------------------
+db_lock = Lock()
+conn = sqlite3.connect("stock.db", check_same_thread=False)
+c = conn.cursor()
 
-if not os.path.exists(RAPPORTS_DIR):
-    os.makedirs(RAPPORTS_DIR)
+# (Le reste de la configuration de la DB ne change pas...)
+c.execute("CREATE TABLE IF NOT EXISTS stock (id INTEGER PRIMARY KEY, produit TEXT UNIQUE, quantite INTEGER)")
+c.execute("CREATE TABLE IF NOT EXISTS achats (id INTEGER PRIMARY KEY, produit TEXT, quantite INTEGER, montant REAL, date_achat TEXT)")
+c.execute("CREATE TABLE IF NOT EXISTS journal (id INTEGER PRIMARY KEY, action TEXT, produit TEXT, quantite INTEGER, montant REAL, date_action TEXT)")
+c.execute("CREATE TABLE IF NOT EXISTS destinataires (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+conn.commit()
+c.execute("INSERT OR IGNORE INTO destinataires (email) VALUES (?)", (EMAIL_SOURCE,))
+conn.commit()
 
-# --- Initialisation BDD ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS ventes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        produit TEXT,
-        categorie TEXT,
-        quantite INTEGER,
-        prix_unitaire REAL
-    )""")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS sorties (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        description TEXT,
-        montant REAL
-    )""")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS cabines (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        numero TEXT UNIQUE,
-        statut TEXT,
-        date_ouverture TEXT,
-        date_fermeture TEXT,
-        operateur TEXT DEFAULT 'Inconnu',
-        solde_actuel REAL DEFAULT 0,
-        total_commissions REAL DEFAULT 0
-    )""")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS points_cabines (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        numero_cabine TEXT,
-        operateur TEXT,
-        espece REAL,
-        float REAL,
-        credit REAL,
-        commissions REAL
-    )""")
-    conn.commit()
-    conn.close()
+# --------------------------
+# Fonctions métier (Seules les fonctions modifiées ou nouvelles sont commentées)
+# --------------------------
 
-# --- Fonctions utilitaires ---
-def confirmer_ajout(message):
-    return st.checkbox(message + " (Confirmez ici avant de valider)")
+def enregistrer_journal(action, produit, quantite=0, montant=0.0):
+    with db_lock:
+        date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        c.execute("INSERT INTO journal (action, produit, quantite, montant, date_action) VALUES (?, ?, ?, ?, ?)",
+                  (action, produit, quantite, montant, date_now))
+        conn.commit()
 
-def get_data(table):
-    conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
-    conn.close()
-    return df
+def supprimer_produit(produit):
+    with db_lock:
+        c.execute("DELETE FROM stock WHERE produit = ?", (produit,))
+        conn.commit()
+    enregistrer_journal("Suppression Produit", produit)
+    return True, f"Le produit '{produit}' a été supprimé du stock."
 
-def ajouter_vente(date, produit, categorie, quantite, prix):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO ventes (date, produit, categorie, quantite, prix_unitaire) VALUES (?, ?, ?, ?, ?)",
-                   (date, produit, categorie, quantite, prix))
-    conn.commit()
-    conn.close()
+# (Les autres fonctions métier comme ajouter_produit, enregistrer_achat, etc. ne changent pas)
+def ajouter_produit(produit, quantite):
+    if not produit.strip(): return False, "Le nom du produit est vide."
+    try:
+        with db_lock:
+            c.execute("INSERT OR IGNORE INTO stock (produit, quantite) VALUES (?, 0)", (produit.strip(),))
+            c.execute("UPDATE stock SET quantite = quantite + ? WHERE produit = ?", (quantite, produit.strip()))
+            conn.commit()
+        enregistrer_journal("Ajout", produit.strip(), quantite, 0)
+        return True, f"{quantite} {produit}(s) ajouté(s) au stock."
+    except Exception as e: return False, f"Erreur lors de l'ajout : {e}"
 
-def ajouter_sortie(date, description, montant):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO sorties (date, description, montant) VALUES (?, ?, ?)",
-                   (date, description, montant))
-    conn.commit()
-    conn.close()
+def enregistrer_achat(produit, quantite, montant):
+    try:
+        with db_lock:
+            date_now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            c.execute("INSERT INTO achats (produit, quantite, montant, date_achat) VALUES (?, ?, ?, ?)",
+                      (produit, quantite, montant, date_now))
+            conn.commit()
+        ajouter_produit(produit, quantite)
+        enregistrer_journal("Achat local", produit, quantite, montant)
+        return True, f"Achat enregistré : {quantite} {produit} pour {montant} FCFA."
+    except Exception as e: return False, f"Erreur enregistrement achat: {e}"
 
-def ajouter_cabine(numero, statut, date_ouverture, date_fermeture, operateur, solde_actuel, total_commissions):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO cabines (numero, statut, date_ouverture, date_fermeture, operateur, solde_actuel, total_commissions)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (numero, statut, date_ouverture, date_fermeture, operateur, solde_actuel, total_commissions))
-    conn.commit()
-    conn.close()
+def vendre_produit(produit, quantite):
+    with db_lock:
+        c.execute("SELECT quantite FROM stock WHERE produit = ?", (produit,))
+        stock = c.fetchone()
+        if stock and stock[0] >= quantite:
+            c.execute("UPDATE stock SET quantite = quantite - ? WHERE produit = ?", (quantite, produit))
+            conn.commit()
+            enregistrer_journal("Vente", produit, quantite, 0)
+            return True, f"{quantite} {produit}(s) vendu(s)."
+        else:
+            return False, f"Stock insuffisant. Actuel: {stock[0] if stock else 0}"
 
-def ajouter_point_journalier(date, numero_cabine, operateur, espece, float_val, credit, commissions):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO points_cabines (date, numero_cabine, operateur, espece, float, credit, commissions)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (date, numero_cabine, operateur, espece, float_val, credit, commissions))
-    conn.commit()
-    conn.close()
+def obtenir_stock():
+    with db_lock:
+        c.execute("SELECT produit, quantite FROM stock ORDER BY produit ASC")
+        rows = c.fetchall()
+    return pd.DataFrame(rows, columns=['Produit', 'Quantité'])
 
-# --- Génération PDF avec tableaux par cabine ---
-def generer_pdf_combine(ventes_df, points_df, nom_fichier):
-    pdf = FPDF()
+def obtenir_journal():
+    with db_lock:
+        c.execute("SELECT action, produit, quantite, montant, date_action FROM journal ORDER BY date_action DESC")
+        rows = c.fetchall()
+    return pd.DataFrame(rows, columns=['Action', 'Produit', 'Quantité', 'Montant', 'Date'])
+
+# (Les fonctions de gestion des destinataires ne changent pas)
+def obtenir_destinataires():
+    with db_lock:
+        c.execute("SELECT email FROM destinataires")
+        return [row[0] for row in c.fetchall()]
+def ajouter_destinataires(emails_a_ajouter):
+    with db_lock:
+        for email in emails_a_ajouter:
+            c.execute("INSERT OR IGNORE INTO destinataires (email) VALUES (?)", (email,))
+        conn.commit()
+def supprimer_destinataire(email_a_supprimer):
+    with db_lock:
+        c.execute("DELETE FROM destinataires WHERE email = ?", (email_a_supprimer,))
+        conn.commit()
+
+# (La fonction generer_pdf_tableau ne change pas)
+def generer_pdf_tableau(df, titre="Rapport"):
+    if not os.path.exists("rapports"):
+        os.makedirs("rapports")
+    pdf = FPDF(orientation='L', unit='mm', format='A4')
     pdf.add_page()
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(200, 10, f"Rapport Combiné {BAR_NOM}", ln=True, align="C")
-    pdf.set_font("Arial", "I", 10)
-    pdf.cell(200, 8, f"Généré le {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, f"{titre} - {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
     pdf.ln(10)
-
-    # Section Ventes
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(200, 8, "Détails des ventes Restaurant", ln=True)
-    pdf.set_font("Arial", "", 10)
-    if ventes_df.empty:
-        pdf.cell(200, 8, "Aucune vente enregistrée.", ln=True)
+    pdf.set_font("Arial", 'B', 10)
+    if not df.empty:
+        col_width = pdf.w / (len(df.columns) + 0.5)
+        for col in df.columns:
+            pdf.cell(col_width, 10, col, border=1, align='C')
+        pdf.ln()
+        pdf.set_font("Arial", '', 9)
+        for _, row in df.iterrows():
+            for item in row:
+                pdf.cell(col_width, 10, str(item), border=1, align='L')
+            pdf.ln()
     else:
-        pdf.cell(25,8,"Date",1); pdf.cell(35,8,"Produit",1); pdf.cell(25,8,"Catégorie",1)
-        pdf.cell(20,8,"Qté",1,align="R"); pdf.cell(30,8,"Prix unit.",1,align="R")
-        pdf.cell(30,8,"Total",1,ln=True,align="R")
-        total_general = 0
-        for _, row in ventes_df.iterrows():
-            total_ligne = row["quantite"] * row["prix_unitaire"]
-            total_general += total_ligne
-            pdf.cell(25,8,str(row["date"]),1)
-            pdf.cell(35,8,str(row["produit"]),1)
-            pdf.cell(25,8,str(row["categorie"]),1)
-            pdf.cell(20,8,f"{row['quantite']}",1,align="R")
-            pdf.cell(30,8,f"{row['prix_unitaire']:.0f}",1,align="R")
-            pdf.cell(30,8,f"{total_ligne:.0f}",1,ln=True,align="R")
-        pdf.set_font("Arial","B",10)
-        pdf.cell(135,8,"TOTAL VENTES",1)
-        pdf.cell(30,8,f"{total_general:.0f}",1,ln=True,align="R")
+        pdf.set_font("Arial", 'I', 12)
+        pdf.cell(0, 10, "Aucune donnée disponible pour ce rapport.", ln=True, align='C')
+    filename = f"rapports/{titre.replace(' ','_').lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    pdf.output(filename)
+    return filename
 
-    pdf.ln(12)
+# ### MODIFICATION 3 ### : Correction du nom de fichier dans l'email
+def envoyer_mail(chemins_pdf, destinataires, sujet="Rapport - Le Noctambul"):
+    if not destinataires:
+        st.warning("Aucun destinataire configuré pour l'envoi d'email.")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_SOURCE
+        msg['To'] = ", ".join(destinataires)
+        msg['Subject'] = sujet
+        msg.attach(MIMEText("Veuillez trouver ci-joint les rapports demandés.", 'plain'))
 
-    # Section Points Cabines par cabine distincte
-    if "numero_cabine" not in points_df.columns:
-        points_df["numero_cabine"] = "N/A"
+        for chemin_pdf in chemins_pdf:
+            with open(chemin_pdf, "rb") as attachment:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(attachment.read())
+            encoders.encode_base64(part)
+            # La méthode ci-dessous est plus robuste pour nommer la pièce jointe
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={os.path.basename(chemin_pdf)}",
+            )
+            msg.attach(part)
+        
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(EMAIL_SOURCE, EMAIL_MDP)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        st.error(f"Erreur lors de l'envoi du mail : {e}")
+        return False
 
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(200, 8, "Détails Points Cabines Mobile Money", ln=True)
-    pdf.ln(4)
+# --------------------------
+# Interface Streamlit
+# --------------------------
+st.title("🍽️ Gestion de Stock - Le Noctambul")
 
-    if points_df.empty:
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(200, 8, "Aucun point enregistré.", ln=True)
+# (La gestion des destinataires dans la sidebar ne change pas)
+st.sidebar.subheader("📧 Emails destinataires")
+destinataires_db = obtenir_destinataires()
+new_emails = st.sidebar.text_area("Ajouter (séparés par virgule)")
+if st.sidebar.button("➕ Ajouter Emails"):
+    emails_a_ajouter = [e.strip() for e in new_emails.split(',') if e.strip()]
+    if emails_a_ajouter:
+        ajouter_destinataires(emails_a_ajouter)
+        st.sidebar.success("Emails ajoutés !")
+        st.experimental_rerun()
+
+for email in destinataires_db:
+    col1, col2 = st.sidebar.columns([4,1])
+    col1.write(email)
+    if email != EMAIL_SOURCE:
+        if col2.button("🗑️", key=f"del_{email}"):
+            supprimer_destinataire(email)
+            st.experimental_rerun()
+
+st.sidebar.markdown("---")
+# ### MODIFICATION ### : Simplification du menu
+menu = st.sidebar.radio("Menu", ["Dashboard", "Ajouter/Vendre", "Rapports"])
+
+if menu == "Dashboard":
+    st.subheader("📊 État actuel du stock")
+    df_stock = obtenir_stock()
+    if not df_stock.empty:
+        stock_faible = df_stock[df_stock['Quantité'] < 5]
+        if not stock_faible.empty:
+            st.error(f"⚠️ {len(stock_faible)} produit(s) en stock critique (< 5) !")
+            st.dataframe(stock_faible, use_container_width=True)
+        
+        st.markdown("---")
+        st.dataframe(df_stock, use_container_width=True)
+        
+        # ### MODIFICATION 1 ### : Ajout d'une section pour supprimer des produits
+        with st.expander("🗑️ Gérer / Supprimer un produit du stock"):
+            produit_a_supprimer = st.selectbox("Choisir le produit à supprimer", df_stock['Produit'], key="sel_prod_del")
+            if st.button(f"Supprimer DÉFINITIVEMENT '{produit_a_supprimer}'"):
+                ok, msg = supprimer_produit(produit_a_supprimer)
+                if ok:
+                    st.success(msg)
+                    st.experimental_rerun() # Rafraîchit pour mettre à jour la liste
+                else:
+                    st.error(msg)
     else:
-        for cabine in points_df["numero_cabine"].dropna().unique():
-            pdf.set_font("Arial", "B", 11)
-            pdf.cell(200, 8, f"Cabine : {cabine}", ln=True)
-            pdf.set_font("Arial", "B", 10)
-            pdf.cell(25,8,"Date",1)
-            pdf.cell(25,8,"Opérateur",1)
-            pdf.cell(25,8,"Espèces",1,align="R")
-            pdf.cell(25,8,"Float",1,align="R")
-            pdf.cell(25,8,"Crédit",1,align="R")
-            pdf.cell(30,8,"Commiss.",1,ln=True,align="R")
+        st.info("Aucun produit en stock.")
 
-            totaux = {"espece":0,"float":0,"credit":0,"commissions":0}
+elif menu == "Ajouter/Vendre":
+    # (Cette section est regroupée et ne change pas fonctionnellement)
+    st.subheader("➕ Ajouter un produit au stock")
+    with st.form("ajout_produit", clear_on_submit=True):
+        # ... (code identique à la version précédente)
+        produit_ajout = st.text_input("Nom du produit")
+        quantite_ajout = st.number_input("Quantité à ajouter", min_value=1, value=1)
+        if st.form_submit_button("Ajouter au stock"):
+            ok, msg = ajouter_produit(produit_ajout, quantite_ajout)
+            if ok: st.success(msg) 
+            else: st.error(msg)
 
-            df_cabine = points_df[points_df["numero_cabine"] == cabine]
-            for _, row in df_cabine.iterrows():
-                pdf.set_font("Arial", "", 10)
-                pdf.cell(25,8,str(row["date"]),1)
-                pdf.cell(25,8,str(row["operateur"]),1)
-                pdf.cell(25,8,f"{row['espece']:.0f}",1,align="R")
-                pdf.cell(25,8,f"{row['float']:.0f}",1,align="R")
-                pdf.cell(25,8,f"{row['credit']:.0f}",1,align="R")
-                pdf.cell(30,8,f"{row['commissions']:.0f}",1,ln=True,align="R")
-                totaux["espece"] += row["espece"]
-                totaux["float"] += row["float"]
-                totaux["credit"] += row["credit"]
-                totaux["commissions"] += row["commissions"]
-
-            pdf.set_font("Arial", "B", 10)
-            pdf.cell(50,8,"TOTAL",1)
-            pdf.cell(25,8,f"{totaux['espece']:.0f}",1,align="R")
-            pdf.cell(25,8,f"{totaux['float']:.0f}",1,align="R")
-            pdf.cell(25,8,f"{totaux['credit']:.0f}",1,align="R")
-            pdf.cell(30,8,f"{totaux['commissions']:.0f}",1,ln=True,align="R")
-            pdf.ln(10)
-
-    path = os.path.join(RAPPORTS_DIR, nom_fichier)
-    pdf.output(path)
-    return path
-
-# --- Envoi email ---
-def envoyer_email_avec_fichier(fichier):
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_SOURCE
-    msg['To'] = EMAIL_DESTINATAIRE
-    msg['Subject'] = f"Rapport PDF {BAR_NOM}"
-    msg.attach(MIMEText("Veuillez trouver ci-joint le rapport combiné.", 'plain'))
-    with open(fichier, "rb") as f:
-        part = MIMEBase('application', 'octet-stream')
-        part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(fichier)}')
-        msg.attach(part)
-    server = smtplib.SMTP('smtp.gmail.com', 587)
-    server.starttls()
-    server.login(EMAIL_SOURCE, EMAIL_MDP)
-    server.send_message(msg)
-    server.quit()
-
-# --- Interface Streamlit principale ---
-def main():
-    st.set_page_config(page_title=f"Gestion Globale - {BAR_NOM}", layout="wide")
-    st.title(f"📊 Gestion Restaurant & 💰 Mobile Money - {BAR_NOM}")
-    init_db()
-
-    # Gestion affichage menu avec bouton
-    if 'show_menu' not in st.session_state:
-        st.session_state.show_menu = True
-
-    if st.button("☰ Menu"):
-        st.session_state.show_menu = not st.session_state.show_menu
-
-    # Affichage sidebar si demandé
-    if st.session_state.show_menu:
-        with st.sidebar:
-            choix = st.radio("Menu Principal", [
-                "Tableau de bord combiné", "Ajouter vente", "Ajouter sortie", "Gestion cabines",
-                "Points journaliers Mobile Money", "Rapport combiné PDF", "Historique détaillé", "⚠️ Réinitialiser BDD"
-            ])
+    st.markdown("---")
+    st.subheader("💸 Vendre un produit")
+    df_stock = obtenir_stock()
+    if not df_stock.empty:
+        with st.form("vente_produit", clear_on_submit=True):
+            # ... (code identique à la version précédente)
+            produit_vente = st.selectbox("Produit à vendre", df_stock['Produit'])
+            quantite_vente = st.number_input("Quantité vendue", min_value=1, value=1)
+            if st.form_submit_button("Vendre"):
+                ok, msg = vendre_produit(produit_vente, quantite_vente)
+                if ok: st.success(msg)
+                else: st.error(msg)
     else:
-        choix = None
+        st.warning("Aucun produit en stock pour la vente.")
 
-    # Affichage contact en haut
-    st.markdown(f"#### 📞 Contact : {BAR_CONTACT}")
+    st.markdown("---")
+    st.subheader("🛒 Enregistrer un achat local (Réapprovisionnement)")
+    if not df_stock.empty:
+        with st.form("achat_local", clear_on_submit=True):
+            # ... (code identique à la version précédente)
+            produit_achat = st.selectbox("Produit acheté", df_stock['Produit'], key="sel_prod_ach")
+            quantite_achat = st.number_input("Quantité achetée", min_value=1, value=1)
+            montant_achat = st.number_input("Montant total (FCFA)", min_value=0.0, step=100.0)
+            if st.form_submit_button("Enregistrer l'achat"):
+                ok, msg = enregistrer_achat(produit_achat, quantite_achat, montant_achat)
+                if ok: st.success(msg)
+                else: st.error(msg)
 
-    if choix == "Tableau de bord combiné":
-        ventes = get_data("ventes")
-        ventes["montant"] = ventes["quantite"] * ventes["prix_unitaire"]
-        sorties = get_data("sorties")
-        points = get_data("points_cabines")
-        total_ventes = ventes["montant"].sum()
-        total_sorties = sorties["montant"].sum()
-        total_mm_commissions = points["commissions"].sum()
-        benefice_global = total_ventes + total_mm_commissions - total_sorties
+# ### MODIFICATION 2 ### : Nouvelle page dédiée aux rapports
+elif menu == "Rapports":
+    st.subheader("📄 Génération et envoi des rapports")
+    
+    col1, col2 = st.columns(2)
 
-        st.metric("Total ventes restaurant", f"{total_ventes:,.0f} FCFA")
-        st.metric("Total commissions Mobile Money", f"{total_mm_commissions:,.0f} FCFA")
-        st.metric("Total sorties", f"{total_sorties:,.0f} FCFA")
-        st.metric("Bénéfice global", f"{benefice_global:,.0f} FCFA")
+    with col1:
+        st.info("Aperçu du Journal des Activités")
+        st.dataframe(obtenir_journal().head(10), height=300)
 
-        st.subheader("Détail ventes restaurant")
-        st.dataframe(ventes)
+    with col2:
+        st.info("Aperçu de l'État du Stock")
+        st.dataframe(obtenir_stock().head(10), height=300)
 
-        st.subheader("Détail points cabines Mobile Money")
-        st.dataframe(points)
+    st.markdown("---")
 
-        # Graphiques ventes par catégorie
-        if not ventes.empty:
-            ventes_categ = ventes.groupby("categorie").agg({"montant":"sum"}).reset_index()
-            fig = px.pie(ventes_categ, names="categorie", values="montant", title="Répartition des ventes par catégorie")
-            st.plotly_chart(fig, use_container_width=True)
+    if st.button("📧 Générer et Envoyer les 2 Rapports par Email"):
+        with st.spinner("Génération des PDF et envoi de l'email..."):
+            pdf_stock = generer_pdf_tableau(obtenir_stock(), titre="Rapport de Stock")
+            pdf_journal = generer_pdf_tableau(obtenir_journal(), titre="Journal des Activites")
+            
+            destinataires = obtenir_destinataires()
+            if envoyer_mail([pdf_stock, pdf_journal], destinataires, sujet="Rapports (Stock et Activités) - Le Noctambul"):
+                st.success("Email avec les deux rapports envoyé avec succès !")
+            else:
+                st.error("L'envoi de l'email a échoué.")
 
-        # Graphique évolution des ventes dans le temps
-        if not ventes.empty:
-            ventes_date = ventes.groupby("date").agg({"montant":"sum"}).reset_index()
-            fig2 = px.bar(ventes_date, x="date", y="montant", title="Évolution des ventes dans le temps")
-            st.plotly_chart(fig2, use_container_width=True)
+    # Section pour télécharger le ZIP
+    if st.button("📥 Générer et Télécharger les 2 Rapports (.zip)"):
+        with st.spinner("Génération des PDF et création de l'archive ZIP..."):
+            pdf_stock_path = generer_pdf_tableau(obtenir_stock(), titre="Rapport_Stock")
+            pdf_journal_path = generer_pdf_tableau(obtenir_journal(), titre="Journal_Activites")
+            
+            zip_filename = f"rapports/Rapports_Le_Noctambul_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            
+            with zipfile.ZipFile(zip_filename, 'w') as zipf:
+                zipf.write(pdf_stock_path, os.path.basename(pdf_stock_path))
+                zipf.write(pdf_journal_path, os.path.basename(pdf_journal_path))
 
-    elif choix == "Ajouter vente":
-        st.subheader("Nouvelle vente")
-        date = st.date_input("Date", value=datetime.now().date())
-        produit = st.text_input("Produit")
-        categorie = st.selectbox("Catégorie", ["Bière", "Plat", "Boisson", "Autre"])
-        quantite = st.number_input("Quantité", min_value=1)
-        prix = st.number_input("Prix unitaire", min_value=0.0)
-        if confirmer_ajout("Confirmer l'ajout") and st.button("Valider"):
-            ajouter_vente(str(date), produit, categorie, quantite, prix)
-            st.success("Vente enregistrée.")
+            with open(zip_filename, "rb") as f:
+                st.download_button(
+                    label="✅ Télécharger le fichier ZIP",
+                    data=f,
+                    file_name=os.path.basename(zip_filename),
+                    mime="application/zip"
+                )
 
-    elif choix == "Ajouter sortie":
-        st.subheader("Nouvelle sortie")
-        date = st.date_input("Date", value=datetime.now().date())
-        description = st.text_input("Description")
-        montant = st.number_input("Montant", min_value=0.0)
-        if confirmer_ajout("Confirmer l'ajout") and st.button("Valider"):
-            ajouter_sortie(str(date), description, montant)
-            st.success("Sortie enregistrée.")
+# La tâche automatique ne change pas, elle enverra toujours les deux rapports
+def check_and_send_auto_report():
+    now = datetime.now()
+    if now.hour in [0, 6] and now.minute < 2:
+        lock_file_path = f"report_sent_{now.strftime('%Y-%m-%d_%H')}.lock"
+        if not os.path.exists(lock_file_path):
+            pdf_stock = generer_pdf_tableau(obtenir_stock(), titre="Rapport de Stock Automatique")
+            pdf_journal = generer_pdf_tableau(obtenir_journal(), titre="Journal des Activites Automatique")
+            destinataires = obtenir_destinataires()
+            sujet = f"Rapports Automatiques du {now.strftime('%d/%m/%Y %H:%M')} - Le Noctambul"
+            envoyer_mail([pdf_stock, pdf_journal], destinataires, sujet)
+            with open(lock_file_path, "w") as f:
+                f.write(now.isoformat())
 
-    elif choix == "Gestion cabines":
-        st.subheader("Ajouter une cabine")
-        numero = st.text_input("Numéro cabine")
-        statut = st.selectbox("Statut", ["Active", "Inoccupée", "En maintenance"])
-        date_ouverture = st.date_input("Date d'ouverture", value=datetime.now().date())
-        date_fermeture = st.text_input("Date de fermeture (facultatif)", value="")
-        operateur = st.selectbox("Opérateur", ["MTN", "Moov", "Wave", "Autre"])
-        solde_actuel = st.number_input("Solde actuel (FCFA)", min_value=0.0)
-        total_commissions = st.number_input("Total commissions (FCFA)", min_value=0.0)
-        if confirmer_ajout("Confirmer l'ajout") and st.button("Ajouter"):
-            ajouter_cabine(numero, statut, str(date_ouverture), date_fermeture if date_fermeture else None,
-                           operateur, solde_actuel, total_commissions)
-            st.success("Cabine ajoutée.")
-        st.subheader("Liste des cabines")
-        st.dataframe(get_data("cabines"))
-
-    elif choix == "Points journaliers Mobile Money":
-        st.subheader("Ajouter point journalier Mobile Money")
-        date = st.date_input("Date", value=datetime.now().date())
-        numero_cabine = st.text_input("Numéro de cabine")
-        operateur = st.selectbox("Opérateur", ["MTN", "Moov", "Celtiis"])
-        espece = st.number_input("Montant en espèces initial", min_value=0.0)
-        float_val = st.number_input("Montant float sur SIM", min_value=0.0)
-        credit = st.number_input("Montant crédit sur SIM", min_value=0.0)
-        commissions = st.number_input("Commission prévue", min_value=0.0)
-        if confirmer_ajout("Confirmer l'ajout") and st.button("Ajouter"):
-            ajouter_point_journalier(str(date), numero_cabine, operateur, espece, float_val, credit, commissions)
-            st.success("Point journalier enregistré.")
-        st.subheader("Historique des points journaliers")
-        st.dataframe(get_data("points_cabines"))
-
-    elif choix == "Rapport combiné PDF":
-        ventes, points = get_data("ventes"), get_data("points_cabines")
-
-        # Dates par défaut
-        if not ventes.empty:
-            min_date = pd.to_datetime(ventes["date"]).min()
-            max_date = pd.to_datetime(ventes["date"]).max()
-        else:
-            min_date = max_date = datetime.now()
-
-        date_debut = st.date_input("Date début", value=min_date)
-        date_fin = st.date_input("Date fin", value=max_date)
-
-        # Gestion sécurité colonne numero_cabine
-        if points.empty or "numero_cabine" not in points.columns:
-            cabines_dispo = []
-        else:
-            cabines_dispo = points["numero_cabine"].dropna().unique().tolist()
-
-        if not cabines_dispo:
-            cabines_dispo = ["Aucune cabine"]
-
-        cabine_choisie = st.multiselect("Filtrer par cabine", cabines_dispo,
-                                       default=cabines_dispo if cabines_dispo != ["Aucune cabine"] else [])
-
-        # Filtrage ventes
-        ventes_f = ventes[
-            (pd.to_datetime(ventes["date"]) >= pd.to_datetime(date_debut)) &
-            (pd.to_datetime(ventes["date"]) <= pd.to_datetime(date_fin))
-        ]
-
-        # Filtrage points
-        if "Aucune cabine" in cabine_choisie:
-            points_f = points[
-                (pd.to_datetime(points["date"]) >= pd.to_datetime(date_debut)) &
-                (pd.to_datetime(points["date"]) <= pd.to_datetime(date_fin))
-            ]
-        else:
-            points_f = points[
-                (pd.to_datetime(points["date"]) >= pd.to_datetime(date_debut)) &
-                (pd.to_datetime(points["date"]) <= pd.to_datetime(date_fin)) &
-                (points["numero_cabine"].isin(cabine_choisie))
-            ]
-
-        if st.button("Générer PDF et envoyer par email"):
-            nom_fichier = f"rapport_combine_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            path = generer_pdf_combine(ventes_f, points_f, nom_fichier)
-            envoyer_email_avec_fichier(path)
-            st.success(f"Rapport généré et envoyé à {EMAIL_DESTINATAIRE}")
-
-    elif choix == "Historique détaillé":
-        st.subheader("Ventes")
-        st.dataframe(get_data("ventes"))
-        st.subheader("Sorties")
-        st.dataframe(get_data("sorties"))
-        st.subheader("Cabines")
-        st.dataframe(get_data("cabines"))
-        st.subheader("Points journaliers Mobile Money")
-        st.dataframe(get_data("points_cabines"))
-
-    elif choix == "⚠️ Réinitialiser BDD":
-        if st.button("Réinitialiser la base de données (TOUTES les données seront perdues)"):
-            os.remove(DB_FILE) if os.path.exists(DB_FILE) else None
-            init_db()
-            st.success("Base de données réinitialisée.")
-
-    # FOOTER
-    st.markdown(
-        f"""
-        <style>
-        footer {{
-            position: fixed;
-            left: 0;
-            bottom: 0;
-            width: 100%;
-            background-color: #f0f2f6;
-            text-align: center;
-            padding: 10px 0;
-            font-size: 12px;
-            color: #888888;
-            z-index: 9999;
-        }}
-        </style>
-        <footer>© 2025 {BAR_NOM} | Contact : {BAR_CONTACT} | Développé par Jannos AHANNINKPO</footer>
-        """,
-        unsafe_allow_html=True
-    )
-
-if __name__ == "__main__":
-    main()
+check_and_send_auto_report()
