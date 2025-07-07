@@ -3,3 +3,4 @@ pandas
 fpdf
 plotly
 numpy
+numexpr 
