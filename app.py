@@ -12,7 +12,7 @@ from fpdf import FPDF
 import os
 import time
 from threading import Lock
-import zipfile  # ### MODIFICATION 1 ### : Import pour créer des fichiers ZIP
+import zipfile
 from pathlib import Path
 
 # --------------------------
@@ -38,7 +38,7 @@ c.execute("INSERT OR IGNORE INTO destinataires (email) VALUES (?)", (EMAIL_SOURC
 conn.commit()
 
 # --------------------------
-# Fonctions métier (Seules les fonctions modifiées ou nouvelles sont commentées)
+# Fonctions métier
 # --------------------------
 
 def enregistrer_journal(action, produit, quantite=0, montant=0.0):
@@ -55,7 +55,6 @@ def supprimer_produit(produit):
     enregistrer_journal("Suppression Produit", produit)
     return True, f"Le produit '{produit}' a été supprimé du stock."
 
-# (Les autres fonctions métier comme ajouter_produit, enregistrer_achat, etc. ne changent pas)
 def ajouter_produit(produit, quantite):
     if not produit.strip(): return False, "Le nom du produit est vide."
     try:
@@ -103,22 +102,22 @@ def obtenir_journal():
         rows = c.fetchall()
     return pd.DataFrame(rows, columns=['Action', 'Produit', 'Quantité', 'Montant', 'Date'])
 
-# (Les fonctions de gestion des destinataires ne changent pas)
 def obtenir_destinataires():
     with db_lock:
         c.execute("SELECT email FROM destinataires")
         return [row[0] for row in c.fetchall()]
+
 def ajouter_destinataires(emails_a_ajouter):
     with db_lock:
         for email in emails_a_ajouter:
             c.execute("INSERT OR IGNORE INTO destinataires (email) VALUES (?)", (email,))
         conn.commit()
+
 def supprimer_destinataire(email_a_supprimer):
     with db_lock:
         c.execute("DELETE FROM destinataires WHERE email = ?", (email_a_supprimer,))
         conn.commit()
 
-# (La fonction generer_pdf_tableau ne change pas)
 def generer_pdf_tableau(df, titre="Rapport"):
     if not os.path.exists("rapports"):
         os.makedirs("rapports")
@@ -145,7 +144,6 @@ def generer_pdf_tableau(df, titre="Rapport"):
     pdf.output(filename)
     return filename
 
-# ### MODIFICATION 3 ### : Correction du nom de fichier dans l'email
 def envoyer_mail(chemins_pdf, destinataires, sujet="Rapport - Le Noctambul"):
     if not destinataires:
         st.warning("Aucun destinataire configuré pour l'envoi d'email.")
@@ -162,7 +160,6 @@ def envoyer_mail(chemins_pdf, destinataires, sujet="Rapport - Le Noctambul"):
                 part = MIMEBase('application', 'octet-stream')
                 part.set_payload(attachment.read())
             encoders.encode_base64(part)
-            # La méthode ci-dessous est plus robuste pour nommer la pièce jointe
             part.add_header(
                 "Content-Disposition",
                 f"attachment; filename={os.path.basename(chemin_pdf)}",
@@ -184,7 +181,6 @@ def envoyer_mail(chemins_pdf, destinataires, sujet="Rapport - Le Noctambul"):
 # --------------------------
 st.title("🍽️ Gestion de Stock - Le Noctambul")
 
-# (La gestion des destinataires dans la sidebar ne change pas)
 st.sidebar.subheader("📧 Emails destinataires")
 destinataires_db = obtenir_destinataires()
 new_emails = st.sidebar.text_area("Ajouter (séparés par virgule)")
@@ -193,7 +189,7 @@ if st.sidebar.button("➕ Ajouter Emails"):
     if emails_a_ajouter:
         ajouter_destinataires(emails_a_ajouter)
         st.sidebar.success("Emails ajoutés !")
-        st.experimental_rerun()
+        st.rerun()  # ## CORRIGÉ ##
 
 for email in destinataires_db:
     col1, col2 = st.sidebar.columns([4,1])
@@ -201,10 +197,9 @@ for email in destinataires_db:
     if email != EMAIL_SOURCE:
         if col2.button("🗑️", key=f"del_{email}"):
             supprimer_destinataire(email)
-            st.experimental_rerun()
+            st.rerun()  # ## CORRIGÉ ##
 
 st.sidebar.markdown("---")
-# ### MODIFICATION ### : Simplification du menu
 menu = st.sidebar.radio("Menu", ["Dashboard", "Ajouter/Vendre", "Rapports"])
 
 if menu == "Dashboard":
@@ -219,24 +214,21 @@ if menu == "Dashboard":
         st.markdown("---")
         st.dataframe(df_stock, use_container_width=True)
         
-        # ### MODIFICATION 1 ### : Ajout d'une section pour supprimer des produits
         with st.expander("🗑️ Gérer / Supprimer un produit du stock"):
             produit_a_supprimer = st.selectbox("Choisir le produit à supprimer", df_stock['Produit'], key="sel_prod_del")
             if st.button(f"Supprimer DÉFINITIVEMENT '{produit_a_supprimer}'"):
                 ok, msg = supprimer_produit(produit_a_supprimer)
                 if ok:
                     st.success(msg)
-                    st.experimental_rerun() # Rafraîchit pour mettre à jour la liste
+                    st.rerun() # ## CORRIGÉ ## Rafraîchit pour mettre à jour la liste
                 else:
                     st.error(msg)
     else:
         st.info("Aucun produit en stock.")
 
 elif menu == "Ajouter/Vendre":
-    # (Cette section est regroupée et ne change pas fonctionnellement)
     st.subheader("➕ Ajouter un produit au stock")
     with st.form("ajout_produit", clear_on_submit=True):
-        # ... (code identique à la version précédente)
         produit_ajout = st.text_input("Nom du produit")
         quantite_ajout = st.number_input("Quantité à ajouter", min_value=1, value=1)
         if st.form_submit_button("Ajouter au stock"):
@@ -246,11 +238,10 @@ elif menu == "Ajouter/Vendre":
 
     st.markdown("---")
     st.subheader("💸 Vendre un produit")
-    df_stock = obtenir_stock()
-    if not df_stock.empty:
+    df_stock_vente = obtenir_stock() # Obtenir les données fraîches pour ce formulaire
+    if not df_stock_vente.empty:
         with st.form("vente_produit", clear_on_submit=True):
-            # ... (code identique à la version précédente)
-            produit_vente = st.selectbox("Produit à vendre", df_stock['Produit'])
+            produit_vente = st.selectbox("Produit à vendre", df_stock_vente['Produit'])
             quantite_vente = st.number_input("Quantité vendue", min_value=1, value=1)
             if st.form_submit_button("Vendre"):
                 ok, msg = vendre_produit(produit_vente, quantite_vente)
@@ -261,10 +252,10 @@ elif menu == "Ajouter/Vendre":
 
     st.markdown("---")
     st.subheader("🛒 Enregistrer un achat local (Réapprovisionnement)")
-    if not df_stock.empty:
+    df_stock_achat = obtenir_stock() # Obtenir les données fraîches pour ce formulaire
+    if not df_stock_achat.empty:
         with st.form("achat_local", clear_on_submit=True):
-            # ... (code identique à la version précédente)
-            produit_achat = st.selectbox("Produit acheté", df_stock['Produit'], key="sel_prod_ach")
+            produit_achat = st.selectbox("Produit acheté", df_stock_achat['Produit'], key="sel_prod_ach")
             quantite_achat = st.number_input("Quantité achetée", min_value=1, value=1)
             montant_achat = st.number_input("Montant total (FCFA)", min_value=0.0, step=100.0)
             if st.form_submit_button("Enregistrer l'achat"):
@@ -272,7 +263,6 @@ elif menu == "Ajouter/Vendre":
                 if ok: st.success(msg)
                 else: st.error(msg)
 
-# ### MODIFICATION 2 ### : Nouvelle page dédiée aux rapports
 elif menu == "Rapports":
     st.subheader("📄 Génération et envoi des rapports")
     
@@ -299,7 +289,6 @@ elif menu == "Rapports":
             else:
                 st.error("L'envoi de l'email a échoué.")
 
-    # Section pour télécharger le ZIP
     if st.button("📥 Générer et Télécharger les 2 Rapports (.zip)"):
         with st.spinner("Génération des PDF et création de l'archive ZIP..."):
             pdf_stock_path = generer_pdf_tableau(obtenir_stock(), titre="Rapport_Stock")
@@ -319,7 +308,7 @@ elif menu == "Rapports":
                     mime="application/zip"
                 )
 
-# La tâche automatique ne change pas, elle enverra toujours les deux rapports
+# La tâche automatique ne change pas
 def check_and_send_auto_report():
     now = datetime.now()
     if now.hour in [0, 6] and now.minute < 2:
@@ -330,7 +319,7 @@ def check_and_send_auto_report():
             destinataires = obtenir_destinataires()
             sujet = f"Rapports Automatiques du {now.strftime('%d/%m/%Y %H:%M')} - Le Noctambul"
             envoyer_mail([pdf_stock, pdf_journal], destinataires, sujet)
-            with open(lock_file_path, "w") as f:
-                f.write(now.isoformat())
+            # Create the lock file
+            Path(lock_file_path).touch()
 
 check_and_send_auto_report()
